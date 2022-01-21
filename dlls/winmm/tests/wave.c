@@ -865,6 +865,163 @@ EXIT:
     HeapFree(GetProcessHeap(), 0, frags);
 }
 
+struct reentrancy_callback_data {
+    HANDLE hevent;
+    // Which thread is currently running the callback, or 0 if it isn't.
+    DWORD running_thread;
+    // How many times the callback's been called.
+    BOOL call_num;
+};
+
+static void CALLBACK reentrancy_callback_func(HWAVEOUT hwo, UINT uMsg,
+                                   DWORD_PTR dwInstance,
+                                   DWORD_PTR dwParam1, DWORD_PTR dwParam2)
+{
+    struct reentrancy_callback_data *data = (struct reentrancy_callback_data *)dwInstance;
+
+    data->call_num += 1;
+
+    todo_wine_if(data->call_num == 3)
+    ok(data->running_thread != GetCurrentThreadId(), "winmm callback called reentrantly, with message %u\n", uMsg);
+    if (data->running_thread) {
+        if (data->running_thread != GetCurrentThreadId()) trace("Callback running on two threads simultaneously\n");
+
+        // Don't mess with what the original call was doing.
+        return;
+    }
+    data->running_thread = GetCurrentThreadId();
+
+    // We have to wait for a `WOM_DONE` event rather than just using the `WOM_OPEN` event
+    // so that we're running on the winmm audio thread, so that we can block it
+    // to prevent the next `WOM_DONE` event just getting fired in the background
+    // (and then presumably calling the callback on another thread?)
+    if (uMsg == WOM_DONE) {
+        if (data->call_num == 2) {
+            MMRESULT rc;
+            // Since this is the first `WOM_DONE`, and the first frame is always `frags[0]`, we know that this is actually a pointer to `frags`.
+            WAVEHDR *frags = (WAVEHDR *)dwParam1;
+
+            rc = waveOutWrite(hwo, &frags[0], sizeof(frags[0]));
+            ok(rc==MMSYSERR_NOERROR,"waveOutWrite(): rc=%s\n", wave_out_error(rc));
+
+            // Each frame is supposed to last 100ms, so 150ms should be enough to guarantee that the last one has finished.
+            Sleep(150);
+
+            // This is needed to trigger the bug in wine,
+            // since winmm checks for `WOM_DONE` within `WINMM_PushData`, which this calls.
+            rc = waveOutWrite(hwo, &frags[1], sizeof(frags[0]));
+            ok(rc==MMSYSERR_NOERROR,"waveOutWrite(): rc=%s\n", wave_out_error(rc));
+        }
+    }
+
+    data->running_thread = 0;
+    // Only do this at the end of the function so that it isn't possible for the main thread
+    // to mistakenly call `waveOutClose` while the test is running.
+    SetEvent(data->hevent);
+}
+
+// Test whether the callback gets called reentrantly when `waveOutWrite` is called
+// from within the callback passed to `waveOutOpen`.
+static void wave_out_test_no_reentrancy(int device)
+{
+    HWAVEOUT wout;
+    HANDLE hevent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    WAVEHDR *frags = 0;
+    MMRESULT rc;
+    int headers = 2;
+    int loops = 0;
+    WAVEFORMATEX format;
+    WAVEFORMATEX* pwfx = &format;
+    DWORD flags = CALLBACK_FUNCTION;
+    double duration = 0.2;
+    DWORD_PTR callback = 0;
+    struct reentrancy_callback_data callback_data;
+    DWORD_PTR callback_instance = 0;
+    char * buffer;
+    DWORD length;
+    DWORD frag_length;
+    int i;
+    BOOL done;
+
+    format.wFormatTag=WAVE_FORMAT_PCM;
+    format.nChannels=1;
+    format.wBitsPerSample=8;
+    format.nSamplesPerSec=22050;
+    format.nBlockAlign=format.nChannels*format.wBitsPerSample/8;
+    format.nAvgBytesPerSec=format.nSamplesPerSec*format.nBlockAlign;
+    format.cbSize=0;
+
+    callback = (DWORD_PTR)reentrancy_callback_func;
+    callback_data.hevent = hevent;
+    callback_data.running_thread = 0;
+    callback_data.call_num = 0;
+    callback_instance = (DWORD_PTR)(&callback_data);
+
+    wout=NULL;
+    rc=waveOutOpen(&wout,device,pwfx,callback,callback_instance,flags);
+    if (rc!=MMSYSERR_NOERROR) {
+        trace("`waveOutOpen` failed with rc %s, skipping", mmsys_error(rc));
+        goto EXIT;
+    }
+
+    rc=WaitForSingleObject(hevent,9000);
+    ok(rc==WAIT_OBJECT_0, "missing WOM_OPEN notification\n");
+
+    frags = HeapAlloc(GetProcessHeap(), 0, headers * sizeof(WAVEHDR));
+
+    buffer=wave_generate_silence(pwfx,duration / (loops + 1),&length);
+
+    /* make sure fragment length is a multiple of block size */
+    frag_length = ((length / headers) / pwfx->nBlockAlign) * pwfx->nBlockAlign;
+
+    for (i = 0; i < headers; i++) {
+        frags[i].lpData=buffer + (i * frag_length);
+        if (i != (headers-1))
+            frags[i].dwBufferLength=frag_length;
+        else {
+            /* use remainder of buffer for last fragment */
+            frags[i].dwBufferLength=length - (i * frag_length);
+        }
+        frags[i].dwFlags=0;
+        frags[i].dwLoops=0;
+        rc=waveOutPrepareHeader(wout, &frags[i], sizeof(frags[0]));
+        ok(rc==MMSYSERR_NOERROR,
+           "waveOutPrepareHeader(%s): rc=%s\n",dev_name(device),wave_out_error(rc));
+    }
+
+    if (rc==MMSYSERR_NOERROR) {
+        // Queue up the first fragment.
+        rc=waveOutWrite(wout, &frags[0], sizeof(frags[0]));
+        ok(rc==MMSYSERR_NOERROR,"waveOutWrite(%s): rc=%s\n",
+           dev_name(device),wave_out_error(rc));
+    }
+
+    done = FALSE;
+    while (!done) {
+        rc=WaitForSingleObject(hevent,8000);
+        ok(rc==WAIT_OBJECT_0, "missing WOM_DONE notification\n");
+
+        done = TRUE;
+        for (i = 0; i < headers; i++) {
+            if (!(frags[i].dwFlags & WHDR_DONE)) {
+                done = FALSE;
+            }
+        }
+    }
+
+    // Calling `waveOutClose` from within the callback hangs on Windows, so we have to make sure to do it here instead.
+    rc = waveOutClose(wout);
+    ok(rc==MMSYSERR_NOERROR,"waveOutClose(): rc=%s\n", wave_out_error(rc));
+
+    rc=WaitForSingleObject(hevent,1500);
+    ok(rc==WAIT_OBJECT_0, "missing WOM_CLOSE notification\n");
+
+    HeapFree(GetProcessHeap(), 0, buffer);
+EXIT:
+    CloseHandle(hevent);
+    HeapFree(GetProcessHeap(), 0, frags);
+}
+
 static void wave_out_test_device(UINT_PTR device)
 {
     WAVEOUTCAPSA capsA;
@@ -983,6 +1140,8 @@ static void wave_out_test_device(UINT_PTR device)
           capsA.wChannels,capsA.dwFormats,capsA.dwSupport);
     trace("     %s\n",wave_out_caps(capsA.dwSupport));
     HeapFree(GetProcessHeap(), 0, nameA);
+
+    wave_out_test_no_reentrancy(device);
 
     if (winetest_interactive && (device != WAVE_MAPPER))
     {
