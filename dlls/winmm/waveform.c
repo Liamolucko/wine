@@ -1948,11 +1948,11 @@ static MMRESULT WINMM_BeginPlaying(WINMM_Device *device)
 
     TRACE("(%p)\n", device->handle);
 
-    if(device->render)
-        /* prebuffer data before starting */
-        WOD_PushData(device);
-
     if(device->stopped){
+        if(device->render)
+            /* prebuffer data before starting */
+            WOD_PushData(device);
+
         device->stopped = FALSE;
 
         hr = IAudioClient_Start(device->client);

@@ -881,7 +881,6 @@ static void CALLBACK reentrancy_callback_func(HWAVEOUT hwo, UINT uMsg,
 
     data->call_num += 1;
 
-    todo_wine_if(data->call_num == 3)
     ok(data->running_thread != GetCurrentThreadId(), "winmm callback called reentrantly, with message %u\n", uMsg);
     if (data->running_thread) {
         if (data->running_thread != GetCurrentThreadId()) trace("Callback running on two threads simultaneously\n");
