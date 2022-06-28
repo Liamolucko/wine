@@ -1791,6 +1791,17 @@ static NTSTATUS WINAPI harddisk_ioctl( DEVICE_OBJECT *device, IRP *irp )
     case IOCTL_STORAGE_QUERY_PROPERTY:
         status = query_property( dev, irp );
         break;
+    case IOCTL_STORAGE_GET_HOTPLUG_INFO:
+    {
+        STORAGE_HOTPLUG_INFO info = {0};
+        DWORD len = min( sizeof(info), irpsp->Parameters.DeviceIoControl.OutputBufferLength );
+        info.Size = sizeof(STORAGE_HOTPLUG_INFO);
+        FIXME("IOCTL_STORAGE_GET_HOTPLUG_INFO stub\n");
+        memcpy( irp->AssociatedIrp.SystemBuffer, &info, len );
+        status = STATUS_SUCCESS;
+        irp->IoStatus.Information = len;
+        break;
+    }
     default:
     {
         ULONG code = irpsp->Parameters.DeviceIoControl.IoControlCode;
